@@ -28,6 +28,9 @@ class NeuroBot:
             except Exception:
                 pass
 
+        if not getattr(Config, "AI_ENABLED", True):
+            self._log("AI Disabled: validation skipped", "WARN")
+
         self.loader = ExchangeLoader()
         self.smc = SMCAnalyzer()
         self.brain = NeuroBrain()
@@ -411,36 +414,52 @@ class NeuroBot:
                         self._log(f"SMC HTF Filter Rejected {symbol} {signal}", "INFO")
                         return
 
-                # AI Validation
-                df_ai = df
-                if scan_limit < int(Config.TRAINING_LOOKBACK_CANDLES):
-                    # --- PERBAIKAN: Cek eksplisit .empty ---
-                    fetched_ai = await self.loader.fetch_candles(symbol, Config.TF_ENTRY, limit=int(Config.TRAINING_LOOKBACK_CANDLES))
-                    if fetched_ai is not None and not fetched_ai.empty:
-                        df_ai = fetched_ai
-                    else:
-                        df_ai = df
-
                 self._log(f"SMC Signal {symbol}: {signal}", "INFO")
 
-                async with self.ai_sem:
-                    mcpt_ok = await asyncio.to_thread(self.brain.mcpt_validation, symbol, df_ai)
-                    if not mcpt_ok:
-                        st = self.brain.states.get(symbol)
-                        if st:
-                            self._log(
-                                f"AI Rejected {symbol} (MCPT) p={st.last_p_value:.4f} real={st.last_real_score:.3f}",
-                                "INFO",
-                            )
+                ai_prob = None
+                ai_p_value = None
+                ai_real_score = None
+                if getattr(Config, "AI_ENABLED", True):
+                    # AI Validation
+                    df_ai = df
+                    if scan_limit < int(Config.TRAINING_LOOKBACK_CANDLES):
+                        # --- PERBAIKAN: Cek eksplisit .empty ---
+                        fetched_ai = await self.loader.fetch_candles(symbol, Config.TF_ENTRY, limit=int(Config.TRAINING_LOOKBACK_CANDLES))
+                        if fetched_ai is not None and not fetched_ai.empty:
+                            df_ai = fetched_ai
                         else:
-                            self._log(f"AI Rejected {symbol} (MCPT) p=n/a real=n/a", "INFO")
+                            df_ai = df
+    
+    
+                    async with self.ai_sem:
+                        mcpt_ok = await asyncio.to_thread(self.brain.mcpt_validation, symbol, df_ai)
+                        if not mcpt_ok:
+                            st = self.brain.states.get(symbol)
+                            if st:
+                                self._log(
+                                    f"AI Rejected {symbol} (MCPT) p={st.last_p_value:.4f} real={st.last_real_score:.3f}",
+                                    "INFO",
+                                )
+                            else:
+                                self._log(f"AI Rejected {symbol} (MCPT) p=n/a real=n/a", "INFO")
+                            return
+    
+                        prob = await asyncio.to_thread(self.brain.predict, symbol, df_ai, signal)
+                    if prob < float(Config.AI_CONFIDENCE_THRESHOLD):
+                        self._log(f"AI Reject {symbol} after SMC {signal} (Low Conf {prob:.2%})", "INFO")
                         return
-
-                    prob = await asyncio.to_thread(self.brain.predict, symbol, df_ai, signal)
-                if prob < float(Config.AI_CONFIDENCE_THRESHOLD):
-                    self._log(f"AI Reject {symbol} after SMC {signal} (Low Conf {prob:.2%})", "INFO")
-                    return
-
+                    st = self.brain.states.get(symbol)
+                    ai_prob = float(prob)
+                    if st:
+                        ai_p_value = float(st.last_p_value)
+                        ai_real_score = float(st.last_real_score)
+                        self._log(
+                            f"AI Pass {symbol} {signal} prob={ai_prob:.2%} p={ai_p_value:.4f} real={ai_real_score:.3f}",
+                            "INFO",
+                        )
+                    else:
+                        self._log(f"AI Pass {symbol} {signal} prob={ai_prob:.2%} p=n/a real=n/a", "INFO")
+    
                 can_trade = await self.manager.check_rules(symbol, side, len(self.positions_by_symbol), self.active_pairs_correlation, self.btc_df, df)
                 if not can_trade: return
 
@@ -473,7 +492,14 @@ class NeuroBot:
                 if qty <= 0: return
 
                 res = await self.executor.place_entry(symbol, side, qty, setup['entry'], setup['sl'], setup['tp'])
-                if res: self._log(f"ORDER SENT: {symbol} {side} {qty}", "WARN")
+                if res:
+                    base_msg = (
+                        f"ORDER SENT: {symbol} {side} {qty} "
+                        f"entry={setup['entry']:.6f} sl={setup['sl']:.6f} tp={setup['tp']:.6f}"
+                    )
+                    if ai_prob is not None:
+                        base_msg += f" ai_prob={ai_prob:.2%}"
+                    self._log(base_msg, "WARN")
 
             except Exception as e:
                 self._log(f"Loop error {symbol}: {e}", "ERROR")
