@@ -39,8 +39,14 @@ class Config:
     HEDGE_SECOND_LEG_REDUCTION = 0.30
     MIN_RR_RATIO = 2.0          
     
-    BREAK_EVEN_TRIGGER_R = 1.0
+    BREAK_EVEN_TRIGGER_R = 1.5
+    BREAK_EVEN_OFFSET_R = 0.1
+    TRAILING_ENABLED = False
     TRAILING_GAP_R = 0.5
+    AUTO_RESTORE_PROTECTIVE = True
+    PROTECTIVE_RESTORE_COOLDOWN_SEC = 30
+    PROTECTIVE_INTENT_ENTRY_TOL_PCT = 0.01
+    PROTECTIVE_INTENT_QTY_TOL_PCT = 0.10
 
     # ==========================================
     # 3. PAIRS & AI

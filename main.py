@@ -1,8 +1,11 @@
 import asyncio
+import json
 import logging
+import os
 import sys
 import time
-from typing import Dict, List
+from datetime import datetime
+from typing import Dict, List, Optional
 import pandas as pd
 from config import Config
 from loader import ExchangeLoader
@@ -49,6 +52,13 @@ class NeuroBot:
         self._last_btc_update = 0.0
         self._last_corr_update = 0.0
         self._last_balance: float = 0.0
+        self._positions_fresh = False
+        self._open_orders_fresh = False
+        self._initial_r_by_key: Dict[str, float] = {}
+        self._paper_initial_r_by_id: Dict[str, float] = {}
+        self._intent_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_intents.json")
+        self._intent_by_key: Dict[str, dict] = self._load_intents()
+        self._last_protective_restore: Dict[str, float] = {}
 
     def _log(self, msg: str, level: str = "INFO"):
         self.dashboard.log(msg, level)
@@ -88,12 +98,135 @@ class NeuroBot:
             if o_type not in ['STOP', 'STOP_MARKET']:
                 continue
             info = o.get('info', {}) or {}
-            if not (o.get('reduceOnly') or info.get('reduceOnly')):
+            if not (o.get('reduceOnly') or info.get('reduceOnly') or o.get('closePosition') or info.get('closePosition')):
                 continue
             if self._order_position_side(o) != position_side:
                 continue
             return o
         return None
+
+    def _find_take_profit_order(self, symbol: str, position_side: str):
+        orders = self.open_orders_by_symbol.get(symbol, [])
+        for o in orders:
+            o_type = (o.get('type') or '').upper()
+            if 'TAKE_PROFIT' not in o_type:
+                continue
+            info = o.get('info', {}) or {}
+            if not (o.get('reduceOnly') or info.get('reduceOnly') or o.get('closePosition') or info.get('closePosition')):
+                continue
+            if self._order_position_side(o) != position_side:
+                continue
+            return o
+        return None
+
+    def _load_intents(self) -> Dict[str, dict]:
+        try:
+            if not os.path.exists(self._intent_file):
+                return {}
+            with open(self._intent_file, 'r') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            out = {}
+            for key, val in data.items():
+                if isinstance(val, dict):
+                    out[key] = val
+            return out
+        except Exception:
+            return {}
+
+    def _save_intents(self):
+        try:
+            tmp_path = self._intent_file + ".tmp"
+            with open(tmp_path, 'w') as f:
+                json.dump(self._intent_by_key, f, indent=2)
+            os.replace(tmp_path, self._intent_file)
+        except Exception:
+            pass
+
+    def _set_intent(self, key: str, entry: float, sl: float, tp: float, qty: float):
+        try:
+            self._intent_by_key[key] = {
+                'entry': float(entry),
+                'sl': float(sl),
+                'tp': float(tp),
+                'qty': float(qty),
+                'ts': float(time.time()),
+            }
+            self._save_intents()
+        except Exception:
+            pass
+
+    def _update_intent_sl(self, key: str, sl: float):
+        intent = self._intent_by_key.get(key)
+        if not intent:
+            return
+        try:
+            intent['sl'] = float(sl)
+            intent['ts'] = float(time.time())
+            self._save_intents()
+        except Exception:
+            pass
+
+    def _clear_intent(self, key: str):
+        if key in self._intent_by_key:
+            self._intent_by_key.pop(key, None)
+            self._save_intents()
+
+    def _get_initial_r(self, key: str, entry: float, current_sl: float, store: Dict[str, float]) -> Optional[float]:
+        r = store.get(key)
+        if r and r > 0:
+            return r
+        try:
+            r = abs(float(entry) - float(current_sl))
+        except Exception:
+            return None
+        if r > 0:
+            store[key] = r
+            return r
+        return None
+
+    def _calc_trailing_sl(
+        self,
+        side: str,
+        entry: float,
+        current: float,
+        current_sl: float,
+        risk_r: float,
+    ) -> Optional[tuple[float, float, float]]:
+        if risk_r <= 0:
+            return None
+        try:
+            entry_f = float(entry)
+            curr_f = float(current)
+            sl_f = float(current_sl)
+        except Exception:
+            return None
+        if sl_f <= 0:
+            return None
+        profit = curr_f - entry_f if side == 'buy' else entry_f - curr_f
+        if profit <= 0:
+            return None
+        profit_r = profit / float(risk_r)
+        base_gap = float(getattr(Config, 'TRAILING_GAP_R', 0.5))
+        gap_r = base_gap
+        if profit_r >= 2.5:
+            gap_r = max(0.2, base_gap * (2.5 / profit_r))
+        start_r = max(float(getattr(Config, 'BREAK_EVEN_TRIGGER_R', 1.0)), 1.0) + gap_r
+        if profit_r < start_r:
+            return None
+        if side == 'buy':
+            new_sl = curr_f - (gap_r * risk_r)
+            if new_sl <= sl_f:
+                return None
+        else:
+            new_sl = curr_f + (gap_r * risk_r)
+            if new_sl >= sl_f:
+                return None
+        min_step = 0.1 * float(risk_r)
+        if abs(new_sl - sl_f) < min_step:
+            return None
+        return float(new_sl), float(profit_r), float(gap_r)
 
     def _estimate_total_risk(self, balance: float) -> float:
         total_risk = 0.0
@@ -221,31 +354,111 @@ class NeuroBot:
             display_pos = []
             pos_map: Dict[str, dict] = {}
             positions = data.get('positions', {}) or {}
+            changed = False
+
+            def _close_paper_position(pid: str, price: float, reason: str):
+                nonlocal changed
+                pos = positions.get(pid)
+                if not pos:
+                    return
+                q = float(pos['qty'])
+                entry = float(pos['entry_price'])
+                side_p = pos.get('side', 'buy')
+                symbol = pos.get('symbol')
+
+                if side_p in ('buy', 'BUY', 'LONG'):
+                    pnl = (float(price) - entry) * q
+                else:
+                    pnl = (entry - float(price)) * q
+
+                self._log(
+                    f"PAPER EXIT {symbol} {side_p} reason={reason} entry={entry:.6f} exit={float(price):.6f} pnl={pnl:.4f}",
+                    "WARN",
+                )
+
+                data['balance'] = float(data.get('balance', 0.0)) + float(pnl)
+                pos['exit_price'] = float(price)
+                pos['exit_reason'] = reason
+                pos['pnl'] = float(pnl)
+                pos['close_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                pos['status'] = "CLOSED"
+                data.setdefault('history', []).append(pos)
+                positions.pop(pid, None)
+                self._paper_initial_r_by_id.pop(str(pid), None)
+                changed = True
+
             for pid, p in list(positions.items()):
                 curr = await self.loader.get_current_price(p['symbol'])
                 if curr is None:
                     continue
                 entry, qty = float(p['entry_price']), float(p['qty'])
                 side_raw = (p.get('side') or 'buy').upper()
-                tp, sl = float(p.get('tp')), float(p.get('sl'))
+                tp = float(p.get('tp'))
+                sl = float(p.get('sl'))
                 side_norm = 'buy' if side_raw in ('BUY', 'LONG') else 'sell'
                 position_side = 'LONG' if side_norm == 'buy' else 'SHORT'
+
+                risk_r = self._get_initial_r(str(pid), entry, sl, self._paper_initial_r_by_id)
+                sl_updated = False
+
+                if sl > 0:
+                    if risk_r:
+                        be_trigger_r = float(getattr(Config, 'BREAK_EVEN_TRIGGER_R', 1.5))
+                        be_offset_r = max(0.0, float(getattr(Config, 'BREAK_EVEN_OFFSET_R', 0.0)))
+                        profit = (curr - entry) if side_norm == 'buy' else (entry - curr)
+                        profit_r = profit / float(risk_r) if risk_r else 0.0
+                        if profit_r >= be_trigger_r:
+                            if side_norm == 'buy':
+                                target_sl = entry + (be_offset_r * risk_r)
+                                if sl < target_sl:
+                                    sl = target_sl
+                                    sl_updated = True
+                                    self._log(
+                                        f"Paper BE+ {p['symbol']} {side_norm} -> {sl:.6f} ({profit_r:.2f}R)",
+                                        "INFO",
+                                    )
+                            else:
+                                target_sl = entry - (be_offset_r * risk_r)
+                                if sl > target_sl:
+                                    sl = target_sl
+                                    sl_updated = True
+                                    self._log(
+                                        f"Paper BE+ {p['symbol']} {side_norm} -> {sl:.6f} ({profit_r:.2f}R)",
+                                        "INFO",
+                                    )
+
+                    if getattr(Config, 'TRAILING_ENABLED', True) and risk_r:
+                        trailing = self._calc_trailing_sl(side_norm, entry, curr, sl, risk_r)
+                        if trailing:
+                            new_sl, profit_r, gap_r = trailing
+                            sl = new_sl
+                            sl_updated = True
+                            self._log(
+                                f"Paper Trailing SL {p['symbol']} {side_norm} -> {sl:.6f} (gap {gap_r:.2f}R, pnl {profit_r:.2f}R)",
+                                "INFO",
+                            )
+
+                if sl_updated:
+                    p['sl'] = float(sl)
+                    changed = True
 
                 if side_raw in ['BUY', 'LONG']:
                     u_pnl = (curr - entry) * qty
                     if curr >= tp:
-                        await self.executor.close_position(pid, p['symbol'], curr, "TP Hit")
+                        _close_paper_position(pid, curr, "TP Hit")
                         continue
                     if curr <= sl:
-                        await self.executor.close_position(pid, p['symbol'], curr, "SL Hit")
+                        reason = "BE+ Hit" if sl > entry else "SL Hit"
+                        _close_paper_position(pid, curr, reason)
                         continue
                 else:
                     u_pnl = (entry - curr) * qty
                     if curr <= tp:
-                        await self.executor.close_position(pid, p['symbol'], curr, "TP Hit")
+                        _close_paper_position(pid, curr, "TP Hit")
                         continue
                     if curr >= sl:
-                        await self.executor.close_position(pid, p['symbol'], curr, "SL Hit")
+                        reason = "BE+ Hit" if sl < entry else "SL Hit"
+                        _close_paper_position(pid, curr, reason)
                         continue
 
                 display_pos.append({'symbol': p['symbol'], 'side': side_raw, 'entry': entry, 'current': curr, 'u_pnl': u_pnl, 'tp': tp, 'sl': sl})
@@ -258,7 +471,11 @@ class NeuroBot:
                     'entry_price': float(entry),
                     'current_price': float(curr),
                 }
-            
+
+            if changed:
+                with open(self.loader.paper_state_file, 'w') as f:
+                    json.dump(data, f, indent=4)
+
             self.active_positions_display = display_pos
             self.positions_by_symbol = pos_map
             self.open_orders_by_symbol = {}
@@ -271,6 +488,8 @@ class NeuroBot:
         pos_by_symbol: Dict[str, dict] = {}
         display = []
         positions_fetch_failed = positions is None
+        self._positions_fresh = not positions_fetch_failed
+        prev_keys = set(self.positions_by_symbol.keys())
 
         for p in positions or []:
             try:
@@ -324,6 +543,8 @@ class NeuroBot:
             open_orders_fetch_failed = True
             self._log(f"Bulk fetch error: {e}", "WARN")
 
+        self._open_orders_fresh = (not open_orders_fetch_failed) and (not positions_fetch_failed)
+
         # 3. Cleanup orphan protective orders only (no open position)
         if not positions_fetch_failed and not open_orders_fetch_failed:
             try:
@@ -372,6 +593,11 @@ class NeuroBot:
             if not open_orders_fetch_failed:
                 self.open_orders_by_symbol = all_open_orders
             self.active_positions_display = display
+            closed_keys = prev_keys - set(pos_by_symbol.keys())
+            if closed_keys:
+                for key in closed_keys:
+                    self._clear_intent(key)
+                    self._initial_r_by_key.pop(key, None)
 
     def _has_exposure(self, symbol: str) -> bool:
         return any(p.get('symbol') == symbol for p in self.positions_by_symbol.values())
@@ -500,6 +726,9 @@ class NeuroBot:
                     if ai_prob is not None:
                         base_msg += f" ai_prob={ai_prob:.2%}"
                     self._log(base_msg, "WARN")
+                    if Config.TRADING_MODE == "LIVE":
+                        key = self._position_key(symbol, side)
+                        self._set_intent(key, res.get('entry_price', setup['entry']), res.get('sl', setup['sl']), res.get('tp', setup['tp']), res.get('qty', qty))
 
             except Exception as e:
                 self._log(f"Loop error {symbol}: {e}", "ERROR")
@@ -522,7 +751,8 @@ class NeuroBot:
                 # Cari order SL aktif di cache memory
                 orders = self.open_orders_by_symbol.get(sym, [])
                 def _is_reduce_only(order):
-                    return bool(order.get('reduceOnly') or (order.get('info', {}) or {}).get('reduceOnly'))
+                    info = order.get('info', {}) or {}
+                    return bool(order.get('reduceOnly') or info.get('reduceOnly') or order.get('closePosition') or info.get('closePosition'))
 
                 sl_order = next(
                     (
@@ -533,27 +763,134 @@ class NeuroBot:
                     ),
                     None,
                 )
+                tp_order = self._find_take_profit_order(sym, position_side)
+
+                if getattr(Config, 'AUTO_RESTORE_PROTECTIVE', True) and self._open_orders_fresh and self._positions_fresh:
+                    missing_sl = sl_order is None
+                    missing_tp = tp_order is None
+                    if missing_sl or missing_tp:
+                        pos_key = self._position_key(sym, side)
+                        intent = self._intent_by_key.get(pos_key)
+                        now_ts = time.time()
+                        cooldown = float(getattr(Config, 'PROTECTIVE_RESTORE_COOLDOWN_SEC', 30))
+                        last_try = self._last_protective_restore.get(pos_key, 0.0)
+                        if now_ts - last_try >= cooldown:
+                            self._last_protective_restore[pos_key] = now_ts
+                            if intent:
+                                intent_ok = True
+                                try:
+                                    intent_entry = float(intent.get('entry') or 0.0)
+                                except Exception:
+                                    intent_entry = 0.0
+                                try:
+                                    intent_qty = float(intent.get('qty') or 0.0)
+                                except Exception:
+                                    intent_qty = 0.0
+                                try:
+                                    entry_tol = float(getattr(Config, 'PROTECTIVE_INTENT_ENTRY_TOL_PCT', 0.01))
+                                except Exception:
+                                    entry_tol = 0.01
+                                try:
+                                    qty_tol = float(getattr(Config, 'PROTECTIVE_INTENT_QTY_TOL_PCT', 0.10))
+                                except Exception:
+                                    qty_tol = 0.10
+
+                                if intent_entry > 0:
+                                    entry_diff = abs(entry_price - intent_entry) / intent_entry
+                                    if entry_diff > entry_tol:
+                                        intent_ok = False
+                                if intent_qty > 0:
+                                    if qty > (intent_qty * (1.0 + qty_tol)):
+                                        intent_ok = False
+
+                                if not intent_ok:
+                                    self._log(
+                                        f"Protective restore skipped {sym} intent mismatch entry={intent_entry:.6f} qty={intent_qty:.6f}",
+                                        "WARN",
+                                    )
+                                else:
+                                    sl_price = intent.get('sl')
+                                    tp_price = intent.get('tp')
+                                    sl_id, tp_id = await self.executor.ensure_protective_orders(
+                                        sym,
+                                        'BUY' if side == 'buy' else 'SELL',
+                                        qty,
+                                        sl_price,
+                                        tp_price,
+                                        sl_order=sl_order,
+                                        tp_order=tp_order,
+                                    )
+                                    if sl_id or tp_id:
+                                        self._log(
+                                            f"Restored protective orders {sym} missing_sl={missing_sl} missing_tp={missing_tp}",
+                                            "WARN",
+                                        )
+                                    else:
+                                        self._log(
+                                            f"Protective restore failed {sym} missing_sl={missing_sl} missing_tp={missing_tp}",
+                                            "WARN",
+                                        )
+                            else:
+                                self._log(
+                                    f"Missing protective orders {sym} but no intent found; skip restore",
+                                    "WARN",
+                                )
 
                 if sl_order:
                     current_sl = float(sl_order.get('stopPrice') or sl_order.get('stop') or 0.0)
-                    
-                    # --- LOGIKA BREAK EVEN SIMPEL ---
-                    # Jika profit sudah > 1% (misal), geser SL ke Entry
-                    if side == 'buy':
-                        pnl_pct = (curr_price - entry_price) / entry_price
-                        if pnl_pct > 0.01 and current_sl < entry_price:
-                            self._log(f"Moving SL to BE for {sym}", "WARN")
-                            ok = await self.executor.update_sl_to_breakeven(sym, 'BUY', qty, entry_price, sl_order=sl_order)
-                            if not ok:
-                                self._log(f"Failed to move SL to BE for {sym}", "WARN")
+                    pos_key = self._position_key(sym, side)
+                    risk_r = self._get_initial_r(pos_key, entry_price, current_sl, self._initial_r_by_key)
+                    sl_updated = False
 
-                    elif side == 'sell':
-                        pnl_pct = (entry_price - curr_price) / entry_price
-                        if pnl_pct > 0.01 and current_sl > entry_price:
-                            self._log(f"Moving SL to BE for {sym}", "WARN")
-                            ok = await self.executor.update_sl_to_breakeven(sym, 'SELL', qty, entry_price, sl_order=sl_order)
-                            if not ok:
-                                self._log(f"Failed to move SL to BE for {sym}", "WARN")
+                    # --- LOGIKA BREAK EVEN ADAPTIF (R-based) ---
+                    if risk_r:
+                        be_trigger_r = float(getattr(Config, 'BREAK_EVEN_TRIGGER_R', 1.5))
+                        be_offset_r = max(0.0, float(getattr(Config, 'BREAK_EVEN_OFFSET_R', 0.0)))
+                        profit = (curr_price - entry_price) if side == 'buy' else (entry_price - curr_price)
+                        profit_r = profit / float(risk_r) if risk_r else 0.0
+                        if profit_r >= be_trigger_r:
+                            if side == 'buy':
+                                target_sl = entry_price + (be_offset_r * risk_r)
+                                if current_sl < target_sl:
+                                    self._log(f"Moving SL to BE+ for {sym} ({profit_r:.2f}R)", "WARN")
+                                    ok = await self.executor.update_sl_to_breakeven(sym, 'BUY', qty, target_sl, sl_order=sl_order)
+                                    if ok:
+                                        current_sl = target_sl
+                                        sl_updated = True
+                                        self._update_intent_sl(pos_key, current_sl)
+                                    else:
+                                        self._log(f"Failed to move SL to BE for {sym}", "WARN")
+                            else:
+                                target_sl = entry_price - (be_offset_r * risk_r)
+                                if current_sl > target_sl:
+                                    self._log(f"Moving SL to BE+ for {sym} ({profit_r:.2f}R)", "WARN")
+                                    ok = await self.executor.update_sl_to_breakeven(sym, 'SELL', qty, target_sl, sl_order=sl_order)
+                                    if ok:
+                                        current_sl = target_sl
+                                        sl_updated = True
+                                        self._update_intent_sl(pos_key, current_sl)
+                                    else:
+                                        self._log(f"Failed to move SL to BE for {sym}", "WARN")
+
+                    if not sl_updated and getattr(Config, 'TRAILING_ENABLED', True) and risk_r:
+                        trailing = self._calc_trailing_sl(side, entry_price, curr_price, current_sl, risk_r)
+                        if trailing:
+                            new_sl, profit_r, gap_r = trailing
+                            ok = await self.executor.update_sl_to_breakeven(
+                                sym,
+                                'BUY' if side == 'buy' else 'SELL',
+                                qty,
+                                new_sl,
+                                sl_order=sl_order,
+                            )
+                            if ok:
+                                self._update_intent_sl(pos_key, new_sl)
+                                self._log(
+                                    f"Trailing SL {sym} {side} -> {new_sl:.6f} (gap {gap_r:.2f}R, pnl {profit_r:.2f}R)",
+                                    "WARN",
+                                )
+                            else:
+                                self._log(f"Failed to trail SL for {sym}", "WARN")
 
             except Exception as e:
                 self._log(f"Manager error {sym}: {e}", "ERROR")

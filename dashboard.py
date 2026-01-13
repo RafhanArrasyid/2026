@@ -43,9 +43,22 @@ class Dashboard:
         print(f"{Colors.HEADER}| {title:^{header_width - 4}} |{Colors.RESET}")
         print(f"{Colors.HEADER}{border}{Colors.RESET}")
 
+        try:
+            bal = float(balance)
+        except Exception:
+            bal = 0.0
+        total_pnl = 0.0
+        for pos in active_positions:
+            try:
+                total_pnl += float(pos.get('u_pnl', 0.0))
+            except Exception:
+                continue
+        equity = bal + total_pnl
+
         # Info Bar
         print(f" Mode    : {mode_color}{Config.TRADING_MODE}{Colors.RESET}")
-        print(f" Balance : {Colors.GREEN}${balance:,.2f}{Colors.RESET}")
+        print(f" Balance : {Colors.GREEN}${bal:,.2f}{Colors.RESET}")
+        print(f" Equity  : {Colors.GREEN}${equity:,.2f}{Colors.RESET}")
         print(f" BTC Stat: {Colors.YELLOW if btc_status != 'STABLE' else Colors.GREEN}{btc_status}{Colors.RESET}")
         print(f" Risk    : {Config.RISK_PER_TRADE*100}% | Pairs: {len(Config.PAIRS)}")
         print("-" * 70)

@@ -290,6 +290,77 @@ class ExecutionHandler:
                 continue
         return None
 
+
+    async def _place_take_profit_order(self, symbol: str, entry_side: str, qty: float, tp: float, order_type_hint: Optional[str] = None, existing_order: Optional[dict] = None):
+        opposite = 'sell' if entry_side.lower() == 'buy' else 'buy'
+        base_params = self._protective_params(entry_side=entry_side, existing_order=existing_order)
+
+        order_types = []
+        if order_type_hint:
+            order_types.append(order_type_hint)
+        order_types.extend(["TAKE_PROFIT_MARKET", "take_profit_market", "TAKE_PROFIT", "take_profit"])
+
+        seen = set()
+        for order_type in order_types:
+            if not order_type or order_type in seen:
+                continue
+            seen.add(order_type)
+            try:
+                o = await self.loader.exchange.create_order(
+                    symbol,
+                    order_type,
+                    opposite,
+                    qty,
+                    None,
+                    {**base_params, 'stopPrice': float(tp)},
+                )
+                tp_id = o.get('id')
+                if tp_id:
+                    return tp_id
+            except Exception:
+                continue
+        return None
+
+    async def ensure_protective_orders(
+        self,
+        symbol: str,
+        entry_side: str,
+        qty: float,
+        sl: Optional[float],
+        tp: Optional[float],
+        sl_order: Optional[dict] = None,
+        tp_order: Optional[dict] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        if Config.TRADING_MODE != "LIVE":
+            return None, None
+        try:
+            qty_p = float(self.loader.amount_to_precision(symbol, float(qty)))
+        except Exception:
+            qty_p = float(qty)
+        if qty_p <= 0:
+            return None, None
+        sl_id = None
+        tp_id = None
+        if sl_order is None and sl is not None:
+            try:
+                sl_val = float(sl)
+            except Exception:
+                sl_val = None
+            if sl_val and sl_val > 0:
+                sl_id = await self._place_stop_loss_order(symbol, entry_side, qty_p, sl_val, existing_order=sl_order)
+                if sl_id:
+                    self._track_order_id(symbol, sl_id)
+        if tp_order is None and tp is not None:
+            try:
+                tp_val = float(tp)
+            except Exception:
+                tp_val = None
+            if tp_val and tp_val > 0:
+                tp_id = await self._place_take_profit_order(symbol, entry_side, qty_p, tp_val, existing_order=tp_order)
+                if tp_id:
+                    self._track_order_id(symbol, tp_id)
+        return sl_id, tp_id
+
     async def update_sl_to_breakeven(self, symbol: str, entry_side: str, qty: float, new_sl: float, sl_order: Optional[dict] = None) -> bool:
         if Config.TRADING_MODE != "LIVE":
             return False
@@ -370,6 +441,7 @@ class ExecutionHandler:
                 params,
             )
             ok = True
+            self._log(f"LIVE EXIT {symbol} {entry_side} reason={reason} qty={float(qty):.6f}", "WARN")
         except Exception as e:
             self._log(f"Close position failed {symbol} ({reason}): {e}", "ERROR")
         await self._cancel_tracked_orders(symbol)
