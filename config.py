@@ -78,3 +78,39 @@ class Config:
     SMC_VOLUME_WINDOW = 20
     SMC_VOLUME_MIN_MULT = 1.0
     SMC_ALLOWED_UTC_HOURS = []
+    # ==========================================
+    # 5. SAFETY & OPS
+    # ==========================================
+    PREFLIGHT_VALIDATE_MODE = True
+    PREFLIGHT_VALIDATE_LEVERAGE = True
+
+    SINGLE_INSTANCE_LOCK = True
+    LOCK_FILE = "bot.lock"
+
+    API_BACKOFF_ENABLED = True
+    API_BACKOFF_BASE_SEC = 1.0
+    API_BACKOFF_MAX_SEC = 30.0
+
+    MAX_DRAWDOWN_PCT = 0.20
+    DRAWDOWN_COOLDOWN_SEC = 7200
+
+    RESTORE_FROM_PENDING = True
+    PROTECTIVE_ORDER_QTY_TOL_PCT = 0.10
+
+    ALERT_ENABLED = False
+    ALERT_PROVIDER = "telegram"  # telegram|discord|email|webhook
+    ALERT_LEVELS = ["ERROR", "WARN"]
+    ALERT_MIN_INTERVAL_SEC = 60
+
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+    ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
+
+    SMTP_HOST = os.getenv("SMTP_HOST", "")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USER = os.getenv("SMTP_USER", "")
+    SMTP_PASS = os.getenv("SMTP_PASS", "")
+    SMTP_TO = os.getenv("SMTP_TO", "")
+    SMTP_FROM = os.getenv("SMTP_FROM", "")
+

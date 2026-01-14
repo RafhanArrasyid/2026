@@ -3,7 +3,7 @@ import logging
 import os
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Callable
 
 from config import Config
 
@@ -17,10 +17,12 @@ class ExecutionHandler:
     - Semua operasi dibungkus try/except agar loop utama tidak crash.
     """
 
-    def __init__(self, loader):
+    def __init__(self, loader, on_pending_entry: Callable | None = None, on_pending_clear: Callable | None = None):
         self.loader = loader
         self.logger = logging.getLogger("neurobot.execution")
         self._orders_by_symbol: dict[str, set[str]] = {}
+        self._on_pending_entry = on_pending_entry
+        self._on_pending_clear = on_pending_clear
 
     def _log(self, msg: str, level: str = "INFO"):
         try:
@@ -78,6 +80,7 @@ class ExecutionHandler:
     # ==========================
     async def _place_live_entry(self, symbol: str, side: str, qty: float, price: float, sl: float, tp: float):
         try:
+            entry_id = None
             # set leverage (ignore error jika tidak support)
             try:
                 await self.loader.exchange.set_leverage(int(Config.LEVERAGE), symbol)
@@ -89,6 +92,7 @@ class ExecutionHandler:
             entry_order = await self.loader.exchange.create_order(symbol, 'limit', side, qty, price, entry_params)
             entry_id = entry_order.get('id')
             self._track_order_id(symbol, entry_id)
+            self._notify_pending_entry(symbol, side, entry_id, price, sl, tp, qty)
 
             # 2) tunggu fill (timeout)
             filled_qty = float(entry_order.get('filled') or 0.0)
@@ -119,6 +123,7 @@ class ExecutionHandler:
                 except Exception as e:
                     self._log(f"Cancel entry failed {symbol}:{entry_id}: {e}", "WARN")
                     await self._cancel_tracked_orders(symbol)
+                self._notify_pending_clear(symbol, side, entry_id)
                 return None
 
             # jika partial fill dan order masih terbuka, cancel sisa agar tidak terisi tanpa proteksi
@@ -143,11 +148,13 @@ class ExecutionHandler:
                 else:
                     await self._cancel_tracked_orders(symbol)
                     await self.close_position_live(symbol, side, filled_qty, reason="Entry cancel failed")
+                    self._notify_pending_clear(symbol, side, entry_id)
                     return None
 
             # normalize filled qty
             filled_qty = self.loader.amount_to_precision(symbol, float(filled_qty))
             if filled_qty <= 0:
+                self._notify_pending_clear(symbol, side, entry_id)
                 return None
             self._untrack_order_id(symbol, entry_id)
 
@@ -162,6 +169,7 @@ class ExecutionHandler:
                 # jika gagal pasang proteksi, tutup posisi agar tidak naked
                 self._log(f"Protective order failed {symbol} SL:{sl_id} TP:{tp_id}", "ERROR")
                 await self.close_position_live(symbol, side, filled_qty, reason="Protective order failed")
+                self._notify_pending_clear(symbol, side, entry_id)
                 return None
 
             return {
@@ -179,6 +187,7 @@ class ExecutionHandler:
 
         except Exception as e:
             self._log(f"Entry flow error {symbol}: {e}", "ERROR")
+            self._notify_pending_clear(symbol, side, entry_id)
             return None
 
     async def _place_protective_orders(self, symbol: str, entry_side: str, qty: float, sl: float, tp: float):
@@ -231,6 +240,23 @@ class ExecutionHandler:
                 continue
 
         return sl_id, tp_id
+
+
+    def _notify_pending_entry(self, symbol: str, side: str, entry_id: Optional[str], entry: float, sl: float, tp: float, qty: float):
+        if not self._on_pending_entry or not entry_id:
+            return
+        try:
+            self._on_pending_entry(symbol, side, str(entry_id), float(entry), float(sl), float(tp), float(qty))
+        except Exception:
+            return
+
+    def _notify_pending_clear(self, symbol: str, side: str, entry_id: Optional[str]):
+        if not self._on_pending_clear or not entry_id:
+            return
+        try:
+            self._on_pending_clear(symbol, side, str(entry_id))
+        except Exception:
+            return
 
     def _position_side(self, entry_side: str) -> Optional[str]:
         if not getattr(Config, 'HEDGE_MODE', False):

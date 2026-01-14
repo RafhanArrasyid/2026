@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 import pandas as pd
+from alerts import AlertManager
 from config import Config
 from loader import ExchangeLoader
 from smc import SMCAnalyzer
@@ -31,6 +33,8 @@ class NeuroBot:
             except Exception:
                 pass
 
+        self.alerts = AlertManager()
+
         if not getattr(Config, "AI_ENABLED", True):
             self._log("AI Disabled: validation skipped", "WARN")
 
@@ -38,13 +42,19 @@ class NeuroBot:
         self.smc = SMCAnalyzer()
         self.brain = NeuroBrain()
         self.manager = RiskManager(self.loader)
-        self.executor = ExecutionHandler(self.loader)
+        self.executor = ExecutionHandler(self.loader, on_pending_entry=self._set_pending_entry, on_pending_clear=self._clear_pending_entry)
 
         self.active_positions_display: List[dict] = []
         self.positions_by_symbol: Dict[str, dict] = {}
         self.open_orders_by_symbol: Dict[str, list] = {}
         self.active_pairs_correlation: Dict[str, float] = {}
         self.btc_df: pd.DataFrame = pd.DataFrame()
+        self.trading_paused = False
+        self._drawdown_triggered = False
+        self._equity_high = 0.0
+        self._drawdown_pause_until = 0.0
+        self._lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), str(getattr(Config, 'LOCK_FILE', 'bot.lock')))
+        self._lock_acquired = False
         self.pairs: List[str] = list(getattr(Config, "PAIRS", []))
 
         self.last_processed_ts: Dict[str, pd.Timestamp] = {}
@@ -58,6 +68,7 @@ class NeuroBot:
         self._initial_r_by_key: Dict[str, float] = {}
         self._paper_initial_r_by_id: Dict[str, float] = {}
         self._intent_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_intents.json")
+        self._pending_entries: Dict[str, dict] = {}
         self._intent_by_key: Dict[str, dict] = self._load_intents()
         self._last_protective_restore: Dict[str, float] = {}
 
@@ -68,6 +79,11 @@ class NeuroBot:
             elif level == "WARN": self.logger.warning(msg)
             else: self.logger.info(msg)
         except Exception: pass
+        try:
+            if self.alerts:
+                self.alerts.notify(level, msg)
+        except Exception:
+            pass
 
     def _normalize_side(self, side: str) -> str:
         s = (side or '').lower()
@@ -178,6 +194,7 @@ class NeuroBot:
         return None
 
     def _load_intents(self) -> Dict[str, dict]:
+        self._pending_entries = {}
         try:
             if not os.path.exists(self._intent_file):
                 return {}
@@ -185,6 +202,19 @@ class NeuroBot:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return {}
+            if 'positions' in data or 'pending_entries' in data:
+                positions = data.get('positions') or {}
+                pending = data.get('pending_entries') or {}
+                out = {}
+                for key, val in positions.items():
+                    if isinstance(val, dict):
+                        out[key] = val
+                pend_out = {}
+                for key, val in pending.items():
+                    if isinstance(val, dict):
+                        pend_out[key] = val
+                self._pending_entries = pend_out
+                return out
             out = {}
             for key, val in data.items():
                 if isinstance(val, dict):
@@ -196,11 +226,88 @@ class NeuroBot:
     def _save_intents(self):
         try:
             tmp_path = self._intent_file + ".tmp"
+            payload = {"positions": self._intent_by_key, "pending_entries": self._pending_entries}
             with open(tmp_path, 'w') as f:
-                json.dump(self._intent_by_key, f, indent=2)
+                json.dump(payload, f, indent=2)
             os.replace(tmp_path, self._intent_file)
         except Exception:
             pass
+
+    def _pending_key(self, symbol: str, side: str, entry_order_id: str) -> str:
+        return f"{symbol}:{side}:{entry_order_id}"
+
+    def _set_pending_entry(self, symbol: str, side: str, entry_order_id: str, entry: float, sl: float, tp: float, qty: float):
+        if not entry_order_id:
+            return
+        try:
+            key = self._pending_key(symbol, side, str(entry_order_id))
+            self._pending_entries[key] = {
+                'symbol': symbol,
+                'side': side,
+                'entry_order_id': str(entry_order_id),
+                'entry': float(entry),
+                'sl': float(sl),
+                'tp': float(tp),
+                'qty': float(qty),
+                'ts': float(time.time()),
+            }
+            self._save_intents()
+        except Exception:
+            return
+
+    def _clear_pending_entry(self, symbol: str, side: str, entry_order_id: str):
+        if not entry_order_id:
+            return
+        try:
+            key = self._pending_key(symbol, side, str(entry_order_id))
+            if key in self._pending_entries:
+                self._pending_entries.pop(key, None)
+                self._save_intents()
+        except Exception:
+            return
+
+    def _find_pending_entry_for_position(self, symbol: str, side: str, entry: float, qty: float):
+        if not self._pending_entries:
+            return None
+        try:
+            entry_tol = float(getattr(Config, 'PROTECTIVE_INTENT_ENTRY_TOL_PCT', 0.01))
+        except Exception:
+            entry_tol = 0.01
+        try:
+            qty_tol = float(getattr(Config, 'PROTECTIVE_INTENT_QTY_TOL_PCT', 0.10))
+        except Exception:
+            qty_tol = 0.10
+        best_key = None
+        best_item = None
+        best_ts = -1.0
+        for key, item in self._pending_entries.items():
+            if not isinstance(item, dict):
+                continue
+            if item.get('symbol') != symbol or item.get('side') != side:
+                continue
+            try:
+                p_entry = float(item.get('entry') or 0.0)
+                p_qty = float(item.get('qty') or 0.0)
+            except Exception:
+                continue
+            if p_entry <= 0 or p_qty <= 0:
+                continue
+            entry_diff = abs(float(entry) - p_entry) / p_entry if p_entry else 0.0
+            if entry_diff > entry_tol:
+                continue
+            if float(qty) > (p_qty * (1.0 + qty_tol)):
+                continue
+            try:
+                ts = float(item.get('ts') or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts >= best_ts:
+                best_ts = ts
+                best_key = key
+                best_item = item
+        if best_key and best_item:
+            return best_key, best_item
+        return None
 
     def _set_intent(self, key: str, entry: float, sl: float, tp: float, qty: float):
         try:
@@ -285,6 +392,202 @@ class NeuroBot:
         if abs(new_sl - sl_f) < min_step:
             return None
         return float(new_sl), float(profit_r), float(gap_r)
+
+    def _order_qty_mismatch(self, order: dict, position_qty: float) -> bool:
+        try:
+            pos_qty = float(position_qty)
+        except Exception:
+            return False
+        if pos_qty <= 0:
+            return False
+        info = order.get('info', {}) or {}
+        raw_qty = order.get('amount') or info.get('origQty') or info.get('origQty'.lower()) or info.get('executedQty')
+        try:
+            order_qty = float(raw_qty)
+        except Exception:
+            return False
+        if order_qty <= 0:
+            return False
+        try:
+            tol = float(getattr(Config, 'PROTECTIVE_ORDER_QTY_TOL_PCT', 0.10))
+        except Exception:
+            tol = 0.10
+        if tol < 0:
+            tol = 0.0
+        return abs(order_qty - pos_qty) / pos_qty > tol
+
+    def _calc_equity(self, balance: float) -> float:
+        total_pnl = 0.0
+        for pos in self.active_positions_display:
+            try:
+                total_pnl += float(pos.get('u_pnl', 0.0))
+            except Exception:
+                continue
+        try:
+            bal = float(balance)
+        except Exception:
+            bal = 0.0
+        return bal + total_pnl
+
+    def _update_drawdown(self, equity: float):
+        try:
+            eq = float(equity)
+        except Exception:
+            return
+        if eq <= 0:
+            return
+        now_ts = time.time()
+        if self.trading_paused:
+            try:
+                pause_until = float(self._drawdown_pause_until or 0.0)
+            except Exception:
+                pause_until = 0.0
+            if pause_until > 0 and now_ts >= pause_until:
+                self.trading_paused = False
+                self._drawdown_triggered = False
+                self._equity_high = eq
+                self._drawdown_pause_until = 0.0
+                self._log("Drawdown cooldown elapsed; trading resumed.", "WARN")
+            return
+        if self._equity_high <= 0 or eq > self._equity_high:
+            self._equity_high = eq
+            return
+        try:
+            max_dd = float(getattr(Config, 'MAX_DRAWDOWN_PCT', 0.0))
+        except Exception:
+            max_dd = 0.0
+        if max_dd <= 0:
+            return
+        drawdown = (self._equity_high - eq) / self._equity_high
+        if not self._drawdown_triggered and drawdown >= max_dd:
+            self._drawdown_triggered = True
+            self.trading_paused = True
+            try:
+                cooldown = float(getattr(Config, 'DRAWDOWN_COOLDOWN_SEC', 0.0))
+            except Exception:
+                cooldown = 0.0
+            if cooldown < 0:
+                cooldown = 0.0
+            self._drawdown_pause_until = now_ts + cooldown if cooldown > 0 else 0.0
+            if cooldown > 0:
+                self._log(f"Drawdown limit hit ({drawdown:.2%}); trading paused for {cooldown:.0f}s.", "ERROR")
+            else:
+                self._log(f"Drawdown limit hit ({drawdown:.2%}); trading paused.", "ERROR")
+
+    def _pid_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+        return True
+
+    def _acquire_instance_lock(self) -> bool:
+        if not getattr(Config, 'SINGLE_INSTANCE_LOCK', True):
+            return True
+        lock_path = self._lock_file
+        try:
+            if os.path.exists(lock_path):
+                old_pid = None
+                try:
+                    with open(lock_path, 'r') as f:
+                        old_pid = int((f.read() or '').strip() or 0)
+                except Exception:
+                    old_pid = None
+                if old_pid and self._pid_alive(old_pid):
+                    self._log(f"Another instance is running (pid={old_pid}).", "ERROR")
+                    return False
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+            with open(lock_path, 'w') as f:
+                f.write(str(os.getpid()))
+            self._lock_acquired = True
+            try:
+                atexit.register(self._release_instance_lock)
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            self._log(f"Lock file error: {e}", "WARN")
+            return True
+
+    def _release_instance_lock(self):
+        if not self._lock_acquired:
+            return
+        try:
+            if os.path.exists(self._lock_file):
+                os.remove(self._lock_file)
+        except Exception:
+            pass
+        self._lock_acquired = False
+
+    async def _preflight_checks(self) -> bool:
+        if Config.TRADING_MODE == "LIVE":
+            if not Config.API_KEY or not Config.SECRET_KEY:
+                self._log("Missing API key/secret for LIVE mode.", "ERROR")
+                return False
+        if not self.pairs:
+            self._log("No valid pairs to trade.", "ERROR")
+            return False
+        try:
+            await self.loader.ensure_markets()
+            markets = getattr(self.loader.exchange, 'markets', None) if self.loader.exchange else None
+            if markets:
+                self._log(f"Markets loaded: {len(markets)} symbols.", "INFO")
+            else:
+                self._log("Markets not available; continuing.", "WARN")
+        except Exception as e:
+            self._log(f"Preflight markets check failed: {e}", "WARN")
+        if Config.TRADING_MODE == "LIVE":
+            try:
+                bal = await self.loader.get_balance()
+                self._log(f"Preflight balance: {float(bal):.2f}", "INFO")
+            except Exception:
+                self._log("Preflight balance check failed.", "WARN")
+            try:
+                pos = await self.loader.fetch_positions()
+                if pos is None:
+                    self._log("Preflight fetch_positions failed.", "WARN")
+            except Exception:
+                self._log("Preflight fetch_positions failed.", "WARN")
+            try:
+                orders = await self.loader.fetch_open_orders(symbol=None)
+                if orders is None:
+                    self._log("Preflight fetch_open_orders failed.", "WARN")
+            except Exception:
+                self._log("Preflight fetch_open_orders failed.", "WARN")
+            await self._validate_account_mode_and_leverage()
+        return True
+
+    async def _validate_account_mode_and_leverage(self):
+        if Config.TRADING_MODE != "LIVE":
+            return
+        if getattr(Config, 'PREFLIGHT_VALIDATE_MODE', True):
+            try:
+                if hasattr(self.loader.exchange, 'set_position_mode'):
+                    await self.loader.exchange.set_position_mode(bool(Config.HEDGE_MODE))
+                    mode = 'HEDGE' if Config.HEDGE_MODE else 'ONE-WAY'
+                    self._log(f"Position mode ensured: {mode}", "INFO")
+            except Exception as e:
+                self._log(f"Position mode check failed: {e}", "WARN")
+        if getattr(Config, 'PREFLIGHT_VALIDATE_LEVERAGE', True):
+            ok = 0
+            fail = 0
+            for sym in self.pairs:
+                try:
+                    await self.loader.exchange.set_leverage(int(Config.LEVERAGE), sym)
+                    ok += 1
+                except Exception:
+                    fail += 1
+                await asyncio.sleep(0.05)
+            if ok or fail:
+                level = 'INFO' if fail == 0 else 'WARN'
+                self._log(f"Leverage preflight: ok={ok} fail={fail}", level)
 
     def _estimate_total_risk(self, balance: float) -> float:
         total_risk = 0.0
@@ -657,6 +960,36 @@ class NeuroBot:
                     self._clear_intent(key)
                     self._initial_r_by_key.pop(key, None)
 
+            if not open_orders_fetch_failed and self._pending_entries:
+                try:
+                    open_entry_ids = set()
+                    for orders in all_open_orders.values():
+                        for o in orders:
+                            info = o.get('info', {}) or {}
+                            if o.get('reduceOnly') or info.get('reduceOnly') or o.get('closePosition') or info.get('closePosition'):
+                                continue
+                            oid = o.get('id')
+                            if oid:
+                                open_entry_ids.add(str(oid))
+                    active_pairs = {(p.get('symbol'), p.get('side')) for p in pos_by_symbol.values() if p.get('symbol') and p.get('side')}
+                    removed = []
+                    for key, item in list(self._pending_entries.items()):
+                        if not isinstance(item, dict):
+                            continue
+                        sym = item.get('symbol')
+                        side = item.get('side')
+                        entry_id = str(item.get('entry_order_id') or '')
+                        if (sym, side) in active_pairs:
+                            continue
+                        if entry_id and entry_id in open_entry_ids:
+                            continue
+                        removed.append(key)
+                        self._pending_entries.pop(key, None)
+                    if removed:
+                        self._save_intents()
+                except Exception:
+                    pass
+
     def _has_exposure(self, symbol: str) -> bool:
         return any(p.get('symbol') == symbol for p in self.positions_by_symbol.values())
 
@@ -675,6 +1008,8 @@ class NeuroBot:
         
         async with self.pair_sem:
             try:
+                if self.trading_paused:
+                    return
                 # Scan limit
                 scan_limit = min(350, int(Config.TRAINING_LOOKBACK_CANDLES))
                 df = await self.loader.fetch_candles(symbol, Config.TF_ENTRY, limit=scan_limit)
@@ -823,12 +1158,43 @@ class NeuroBot:
                 )
                 tp_order = self._find_take_profit_order(sym, position_side)
 
+                if sl_order and self._order_qty_mismatch(sl_order, qty):
+                    try:
+                        self._log(f"Protective SL qty mismatch {sym}; refreshing.", "WARN")
+                        oid = sl_order.get('id') if isinstance(sl_order, dict) else None
+                        if oid:
+                            await self.executor.cancel_order(sym, oid)
+                    except Exception:
+                        pass
+                    sl_order = None
+
+                if tp_order and self._order_qty_mismatch(tp_order, qty):
+                    try:
+                        self._log(f"Protective TP qty mismatch {sym}; refreshing.", "WARN")
+                        oid = tp_order.get('id') if isinstance(tp_order, dict) else None
+                        if oid:
+                            await self.executor.cancel_order(sym, oid)
+                    except Exception:
+                        pass
+                    tp_order = None
+
                 if getattr(Config, 'AUTO_RESTORE_PROTECTIVE', True) and self._open_orders_fresh and self._positions_fresh:
                     missing_sl = sl_order is None
                     missing_tp = tp_order is None
                     if missing_sl or missing_tp:
                         pos_key = self._position_key(sym, side)
                         intent = self._intent_by_key.get(pos_key)
+                        if not intent and getattr(Config, 'RESTORE_FROM_PENDING', True):
+                            pending_match = self._find_pending_entry_for_position(sym, side, entry_price, qty)
+                            if pending_match:
+                                p_key, p_item = pending_match
+                                try:
+                                    self._set_intent(pos_key, p_item.get('entry'), p_item.get('sl'), p_item.get('tp'), p_item.get('qty'))
+                                    self._clear_pending_entry(sym, side, p_item.get('entry_order_id'))
+                                    intent = self._intent_by_key.get(pos_key)
+                                    self._log(f"Pending entry matched {sym}; restoring protections.", "WARN")
+                                except Exception:
+                                    intent = self._intent_by_key.get(pos_key)
                         now_ts = time.time()
                         cooldown = float(getattr(Config, 'PROTECTIVE_RESTORE_COOLDOWN_SEC', 30))
                         last_try = self._last_protective_restore.get(pos_key, 0.0)
@@ -970,9 +1336,16 @@ class NeuroBot:
                         "INFO",
                     )
                 
+                equity = self._calc_equity(bal)
+                self._update_drawdown(equity)
+
                 # Render Dashboard di loop scanner
                 corr_display = self._build_btc_corr_display()
                 self.dashboard.render(bal, self.active_positions_display, btc_corr_display=corr_display)
+
+                if self.trading_paused:
+                    await asyncio.sleep(float(Config.LOOP_SLEEP_SEC))
+                    continue
                 
                 tasks = [self._process_pair(pair) for pair in self.pairs]
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -1000,13 +1373,23 @@ class NeuroBot:
                 await asyncio.sleep(5)
 
     async def run(self):
+        if not self._acquire_instance_lock():
+            return
         await self._validate_pairs()
+        ok = await self._preflight_checks()
+        if not ok:
+            self._release_instance_lock()
+            return
+        self.alerts.start()
         self._log("Bot Started. Running Hybrid Loops...", "INFO")
-        # Jalankan 2 task parallel
-        await asyncio.gather(
-            self.task_market_scanner(),
-            self.task_position_manager()
-        )
+        try:
+            # Jalankan 2 task parallel
+            await asyncio.gather(
+                self.task_market_scanner(),
+                self.task_position_manager()
+            )
+        finally:
+            self._release_instance_lock()
 
 if __name__ == "__main__":
     bot = NeuroBot()

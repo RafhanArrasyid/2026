@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any, Optional
 
 import ccxt
@@ -20,13 +21,41 @@ class BinanceSyncWrapper:
     def __init__(self, config: dict[str, Any]):
         self.client = ccxt.binance(config)
         self._lock = asyncio.Lock()
+        self._error_streak = 0
+        self._backoff_until = 0.0
 
     def __getattr__(self, name: str):
         return getattr(self.client, name)
 
     async def _call(self, fn, *args, **kwargs):
         async with self._lock:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            try:
+                if getattr(Config, 'API_BACKOFF_ENABLED', True):
+                    delay = max(0.0, float(self._backoff_until) - time.time())
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+            except Exception:
+                pass
+            try:
+                result = await asyncio.to_thread(fn, *args, **kwargs)
+            except Exception:
+                try:
+                    if getattr(Config, 'API_BACKOFF_ENABLED', True):
+                        self._error_streak = min(int(self._error_streak) + 1, 10)
+                        base = float(getattr(Config, 'API_BACKOFF_BASE_SEC', 1.0))
+                        max_b = float(getattr(Config, 'API_BACKOFF_MAX_SEC', 30.0))
+                        if base < 0:
+                            base = 0.0
+                        if max_b < 0:
+                            max_b = 0.0
+                        backoff = min(max_b, base * (2 ** max(self._error_streak - 1, 0)))
+                        self._backoff_until = time.time() + float(backoff)
+                except Exception:
+                    pass
+                raise
+            else:
+                self._error_streak = 0
+                return result
 
     async def load_markets(self):
         return await self._call(self.client.load_markets)

@@ -2,4 +2,5 @@
 live_intents.json
 .env 
 __pycache__/ 
-*.pyc 
+*.pyc
+bot.lock
