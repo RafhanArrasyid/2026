@@ -687,3 +687,7 @@
 2026-01-13 18:06:07,330 INFO Risk used: 0.00/3.50 (rem 3.50)
 2026-01-13 18:06:55,256 INFO Risk used: 0.00/3.50 (rem 3.50)
 2026-01-13 18:07:43,149 INFO Risk used: 0.00/3.50 (rem 3.50)
+2026-01-14 09:01:48,731 INFO Validating pairs against exchange markets...
+2026-01-14 09:01:53,577 INFO Pair validation: 20 valid, 0 invalid.
+2026-01-14 09:01:53,577 INFO Bot Started. Running Hybrid Loops...
+2026-01-14 09:01:53,894 INFO Risk used: 0.00/3.50 (rem 3.50)

@@ -45,6 +45,7 @@ class NeuroBot:
         self.open_orders_by_symbol: Dict[str, list] = {}
         self.active_pairs_correlation: Dict[str, float] = {}
         self.btc_df: pd.DataFrame = pd.DataFrame()
+        self.pairs: List[str] = list(getattr(Config, "PAIRS", []))
 
         self.last_processed_ts: Dict[str, pd.Timestamp] = {}
         self.pair_sem = asyncio.Semaphore(int(Config.MAX_CONCURRENT_PAIRS))
@@ -78,6 +79,63 @@ class NeuroBot:
 
     def _position_key(self, symbol: str, side: str) -> str:
         return f"{symbol}:{side.lower()}"
+
+    async def _validate_pairs(self):
+        pairs = [p.strip() for p in getattr(Config, "PAIRS", []) if isinstance(p, str)]
+        if not pairs:
+            self._log("Config.PAIRS kosong atau tidak valid.", "ERROR")
+            self.pairs = []
+            return
+        self._log("Validating pairs against exchange markets...", "INFO")
+        try:
+            await self.loader.ensure_markets()
+            markets = getattr(self.loader.exchange, "markets", None) if self.loader.exchange else None
+            if not markets:
+                self._log("Pair validation skipped: markets unavailable.", "WARN")
+                self.pairs = pairs
+                return
+            invalid = [p for p in pairs if p not in markets]
+            invalid_set = set(invalid)
+            valid = [p for p in pairs if p not in invalid_set]
+            if invalid:
+                self._log(f"Invalid pairs in Config.PAIRS: {', '.join(invalid)}", "ERROR")
+                self._log("Invalid pairs will be skipped.", "WARN")
+            self._log(f"Pair validation: {len(valid)} valid, {len(invalid)} invalid.", "INFO")
+            self.pairs = valid
+        except Exception as e:
+            self._log(f"Pair validation failed: {e}", "WARN")
+            self.pairs = pairs
+
+    def _build_btc_corr_display(self) -> str:
+        try:
+            threshold = float(getattr(Config, "MAX_CORRELATION_BTC", 0.0))
+        except Exception:
+            threshold = 0.0
+        items = []
+        for key, corr in sorted(self.active_pairs_correlation.items(), key=lambda x: x[1], reverse=True):
+            try:
+                corr_val = float(corr)
+            except Exception:
+                continue
+            if corr_val != corr_val:
+                continue
+            if corr_val <= threshold:
+                continue
+            if isinstance(key, str) and ':' in key:
+                sym, side = key.rsplit(':', 1)
+            else:
+                sym, side = key, ''
+            if side == 'buy':
+                side_disp = 'BUY'
+            elif side == 'sell':
+                side_disp = 'SELL'
+            else:
+                side_disp = side.upper() if isinstance(side, str) else ''
+            if side_disp:
+                items.append(f"{sym} {side_disp} {corr_val:.2f}")
+            else:
+                items.append(f"{sym} {corr_val:.2f}")
+        return ' | '.join(items) if items else 'none'
 
     def _order_position_side(self, order: dict) -> str:
         info = order.get('info', {}) or {}
@@ -913,9 +971,10 @@ class NeuroBot:
                     )
                 
                 # Render Dashboard di loop scanner
-                self.dashboard.render(bal, self.active_positions_display)
+                corr_display = self._build_btc_corr_display()
+                self.dashboard.render(bal, self.active_positions_display, btc_corr_display=corr_display)
                 
-                tasks = [self._process_pair(pair) for pair in Config.PAIRS]
+                tasks = [self._process_pair(pair) for pair in self.pairs]
                 await asyncio.gather(*tasks, return_exceptions=True)
                 
                 # Sleep lama sesuai config baru (misal 45s)
@@ -941,6 +1000,7 @@ class NeuroBot:
                 await asyncio.sleep(5)
 
     async def run(self):
+        await self._validate_pairs()
         self._log("Bot Started. Running Hybrid Loops...", "INFO")
         # Jalankan 2 task parallel
         await asyncio.gather(

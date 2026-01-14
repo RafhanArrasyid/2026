@@ -31,7 +31,7 @@ class Dashboard:
     def clear_screen(self):
         os.system('cls' if os.name == 'nt' else 'clear')
 
-    def render(self, balance, active_positions, btc_status="STABLE"):
+    def render(self, balance, active_positions, btc_status="STABLE", btc_corr_display=""):
         self.clear_screen()
         
         # Header
@@ -61,6 +61,12 @@ class Dashboard:
         print(f" Equity  : {Colors.GREEN}${equity:,.2f}{Colors.RESET}")
         print(f" BTC Stat: {Colors.YELLOW if btc_status != 'STABLE' else Colors.GREEN}{btc_status}{Colors.RESET}")
         print(f" Risk    : {Config.RISK_PER_TRADE*100}% | Pairs: {len(Config.PAIRS)}")
+        corr_text = btc_corr_display if btc_corr_display else "none"
+        try:
+            corr_thresh = float(getattr(Config, "MAX_CORRELATION_BTC", 0.0))
+        except Exception:
+            corr_thresh = 0.0
+        print(f" BTC Corr>{corr_thresh:.2f}: {corr_text}")
         print("-" * 70)
 
         # Active Positions Table
