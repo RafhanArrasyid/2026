@@ -97,7 +97,7 @@ class Config:
     RESTORE_FROM_PENDING = True
     PROTECTIVE_ORDER_QTY_TOL_PCT = 0.10
 
-    ALERT_ENABLED = False
+    ALERT_ENABLED = True
     ALERT_PROVIDER = "telegram"  # telegram|discord|email|webhook
     ALERT_LEVELS = ["ERROR", "WARN"]
     ALERT_MIN_INTERVAL_SEC = 60

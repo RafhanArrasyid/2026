@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -71,6 +72,36 @@ class NeuroBot:
         self._pending_entries: Dict[str, dict] = {}
         self._intent_by_key: Dict[str, dict] = self._load_intents()
         self._last_protective_restore: Dict[str, float] = {}
+        self._close_all_requested = False
+        self._close_all_inflight = False
+        self._stdin_thread = None
+
+    def _start_stdin_listener(self) -> bool:
+        try:
+            if not sys.stdin or not sys.stdin.isatty():
+                return False
+        except Exception:
+            return False
+        if self._stdin_thread:
+            return True
+
+        def _stdin_loop():
+            while True:
+                try:
+                    line = sys.stdin.readline()
+                except Exception:
+                    break
+                if line == "":
+                    break
+                cmd = line.strip().lower()
+                if not cmd:
+                    continue
+                if cmd in ("close", "closeall", "close-all", "close all"):
+                    self._close_all_requested = True
+        t = threading.Thread(target=_stdin_loop, daemon=True)
+        t.start()
+        self._stdin_thread = t
+        return True
 
     def _log(self, msg: str, level: str = "INFO"):
         self.dashboard.log(msg, level)
@@ -1261,7 +1292,14 @@ class NeuroBot:
                                 )
 
                 if sl_order:
-                    current_sl = float(sl_order.get('stopPrice') or sl_order.get('stop') or 0.0)
+                    sl_info = sl_order.get('info', {}) or {}
+                    current_sl = float(
+                        sl_order.get('stopPrice')
+                        or sl_order.get('stop')
+                        or sl_info.get('stopPrice')
+                        or sl_info.get('stop')
+                        or 0.0
+                    )
                     pos_key = self._position_key(sym, side)
                     risk_r = self._get_initial_r(pos_key, entry_price, current_sl, self._initial_r_by_key)
                     sl_updated = False
@@ -1319,6 +1357,106 @@ class NeuroBot:
             except Exception as e:
                 self._log(f"Manager error {sym}: {e}", "ERROR")
 
+    async def _close_all_positions(self):
+        prev_paused = self.trading_paused
+        self.trading_paused = True
+        self._log("Manual CLOSE-ALL triggered; closing positions and canceling orders.", "WARN")
+
+        canceled = 0
+        cancel_failed = 0
+        closed = 0
+        close_failed = 0
+
+        if Config.TRADING_MODE == "LIVE":
+            orders = await self.loader.fetch_open_orders(symbol=None)
+            if orders is None:
+                orders = []
+                for items in self.open_orders_by_symbol.values():
+                    orders.extend(items)
+            for o in orders:
+                sym = o.get('symbol') or (o.get('info', {}) or {}).get('symbol')
+                oid = o.get('id') or (o.get('info', {}) or {}).get('orderId')
+                if not sym or not oid:
+                    continue
+                try:
+                    await self.executor.cancel_order(sym, oid)
+                    canceled += 1
+                except Exception:
+                    cancel_failed += 1
+
+            positions = await self.loader.fetch_positions()
+            if positions is None:
+                positions = []
+                for p in self.positions_by_symbol.values():
+                    if p.get('symbol'):
+                        positions.append(p)
+
+            for p in positions:
+                try:
+                    if 'qty' in p and p.get('symbol') and p.get('side'):
+                        sym = p.get('symbol')
+                        qty = float(p.get('qty') or 0.0)
+                        side = p.get('side')
+                    else:
+                        sym = p.get('symbol') or p.get('info', {}).get('symbol')
+                        if not sym:
+                            continue
+                        raw_qty = self._extract_raw_position_qty(p)
+                        qty = abs(raw_qty)
+                        if qty <= 0:
+                            continue
+                        info = p.get('info', {}) or {}
+                        side = self._normalize_side(p.get('side') or '')
+                        pos_side = (info.get('positionSide') or '').upper()
+                        if not side and pos_side:
+                            side = 'buy' if pos_side == 'LONG' else 'sell'
+                        if not side:
+                            side = 'buy' if raw_qty > 0 else 'sell'
+                    if qty <= 0:
+                        continue
+                    ok = await self.executor.close_position_live(sym, side, qty, reason="Manual Close All")
+                    if ok:
+                        closed += 1
+                    else:
+                        close_failed += 1
+                except Exception:
+                    close_failed += 1
+        else:
+            try:
+                with open(self.loader.paper_state_file, 'r') as f:
+                    data = json.load(f)
+                positions = data.get('positions', {}) or {}
+            except Exception:
+                positions = {}
+            for pid, pos in list(positions.items()):
+                sym = pos.get('symbol')
+                if not sym:
+                    continue
+                price = await self.loader.get_current_price(sym)
+                if price is None:
+                    try:
+                        price = float(pos.get('entry_price') or 0.0)
+                    except Exception:
+                        price = 0.0
+                try:
+                    await self.executor.close_position(pid, sym, float(price), reason="Manual Close All")
+                    closed += 1
+                except Exception:
+                    close_failed += 1
+
+        self._intent_by_key = {}
+        self._pending_entries = {}
+        self._initial_r_by_key = {}
+        self._paper_initial_r_by_id = {}
+        self._save_intents()
+
+        self._log(
+            f"Close-all done: closed={closed} canceled_orders={canceled} "
+            f"cancel_failed={cancel_failed} close_failed={close_failed}",
+            "WARN",
+        )
+        self.trading_paused = prev_paused
+
     async def task_market_scanner(self):
         """Loop Lambat: Scanner Entry (Hemat API)"""
         while True:
@@ -1360,6 +1498,14 @@ class NeuroBot:
         """Loop Cepat: Monitor Posisi & Trailing (Responsif)"""
         while True:
             try:
+                if self._close_all_requested and not self._close_all_inflight:
+                    self._close_all_inflight = True
+                    try:
+                        await self._close_all_positions()
+                    finally:
+                        self._close_all_requested = False
+                        self._close_all_inflight = False
+
                 # Update posisi (Bulk Fetch)
                 await self._sync_positions()
                 
@@ -1381,6 +1527,9 @@ class NeuroBot:
             self._release_instance_lock()
             return
         self.alerts.start()
+        stdin_ok = self._start_stdin_listener()
+        if stdin_ok:
+            self._log("Console command ready: type 'close' + Enter to close all positions/orders.", "INFO")
         self._log("Bot Started. Running Hybrid Loops...", "INFO")
         try:
             # Jalankan 2 task parallel

@@ -143,6 +143,10 @@ class NeuroBrain:
         """
         if n_iterations is None:
             n_iterations = int(Config.MCPT_ITERATIONS)
+        try:
+            n_iterations = int(n_iterations)
+        except Exception:
+            n_iterations = int(Config.MCPT_ITERATIONS)
 
         now = time.time()
         st = self.states.get(symbol)
@@ -153,6 +157,11 @@ class NeuroBrain:
             return False
 
         st = self.states[symbol]
+        if n_iterations <= 0:
+            try:
+                return float(st.last_real_score or 0.0) >= 0.35
+            except Exception:
+                return False
         # jika MCPT masih "fresh", pakai hasil sebelumnya
         if st.last_mcpt_ts > 0 and Config.AI_RETRAIN_COOLDOWN_SEC > 0:
             if (now - st.last_mcpt_ts) < Config.AI_RETRAIN_COOLDOWN_SEC:

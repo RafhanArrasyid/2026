@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -52,14 +53,38 @@ class ExecutionHandler:
         if not ids:
             self._orders_by_symbol.pop(symbol, None)
 
+    async def _cancel_order_with_retries(
+        self,
+        symbol: str,
+        order_id: Optional[str],
+        *,
+        attempts: int = 3,
+        delay_sec: float = 0.5,
+    ) -> bool:
+        if not order_id:
+            return False
+        tries = max(1, int(attempts))
+        last_exc = None
+        for attempt in range(tries):
+            try:
+                await self.loader.exchange.cancel_order(order_id, symbol)
+                self._untrack_order_id(symbol, order_id)
+                return True
+            except Exception as e:
+                last_exc = e
+                if attempt < tries - 1:
+                    try:
+                        await asyncio.sleep(float(delay_sec))
+                    except Exception:
+                        pass
+        if last_exc:
+            self._log(f"Cancel order failed {symbol}:{order_id}: {last_exc}", "WARN")
+        return False
+
     async def _cancel_tracked_orders(self, symbol: str):
         order_ids = list(self._orders_by_symbol.get(symbol, set()))
         for oid in order_ids:
-            try:
-                await self.loader.exchange.cancel_order(oid, symbol)
-                self._untrack_order_id(symbol, oid)
-            except Exception as e:
-                self._log(f"Cancel tracked order failed {symbol}:{oid}: {e}", "WARN")
+            await self._cancel_order_with_retries(symbol, oid, attempts=2, delay_sec=0.5)
 
     async def place_entry(self, symbol: str, side: str, qty: float, price: float, sl: float, tp: float):
         if qty <= 0:
@@ -93,6 +118,7 @@ class ExecutionHandler:
             entry_id = entry_order.get('id')
             self._track_order_id(symbol, entry_id)
             self._notify_pending_entry(symbol, side, entry_id, price, sl, tp, qty)
+            last_order = entry_order
 
             # 2) tunggu fill (timeout)
             filled_qty = float(entry_order.get('filled') or 0.0)
@@ -108,6 +134,8 @@ class ExecutionHandler:
                     await asyncio.sleep(float(Config.ENTRY_ORDER_POLL_SEC))
                     try:
                         o = await self.loader.exchange.fetch_order(entry_id, symbol)
+                        if isinstance(o, dict):
+                            last_order = o
                         status = (o.get('status') or '').lower()
                         filled_qty = float(o.get('filled') or 0.0)
                         if status in ("closed", "filled"):
@@ -117,11 +145,8 @@ class ExecutionHandler:
 
             # kalau belum filled, cancel
             if filled_qty <= 0:
-                try:
-                    await self.loader.exchange.cancel_order(entry_id, symbol)
-                    self._untrack_order_id(symbol, entry_id)
-                except Exception as e:
-                    self._log(f"Cancel entry failed {symbol}:{entry_id}: {e}", "WARN")
+                cancel_ok = await self._cancel_order_with_retries(symbol, entry_id, attempts=3, delay_sec=0.5)
+                if not cancel_ok:
                     await self._cancel_tracked_orders(symbol)
                 self._notify_pending_clear(symbol, side, entry_id)
                 return None
@@ -129,18 +154,13 @@ class ExecutionHandler:
             # jika partial fill dan order masih terbuka, cancel sisa agar tidak terisi tanpa proteksi
             orig_qty = float(qty)
             if filled_qty < orig_qty and status not in final_statuses:
-                cancel_ok = False
-                try:
-                    await self.loader.exchange.cancel_order(entry_id, symbol)
-                    self._untrack_order_id(symbol, entry_id)
-                    cancel_ok = True
-                except Exception as e:
-                    self._log(f"Cancel partial entry failed {symbol}:{entry_id}: {e}", "WARN")
-                    cancel_ok = False
+                cancel_ok = await self._cancel_order_with_retries(symbol, entry_id, attempts=3, delay_sec=0.5)
 
                 if cancel_ok:
                     try:
                         o = await self.loader.exchange.fetch_order(entry_id, symbol)
+                        if isinstance(o, dict):
+                            last_order = o
                         status = (o.get('status') or status).lower()
                         filled_qty = max(filled_qty, float(o.get('filled') or 0.0))
                     except Exception:
@@ -157,6 +177,17 @@ class ExecutionHandler:
                 self._notify_pending_clear(symbol, side, entry_id)
                 return None
             self._untrack_order_id(symbol, entry_id)
+
+            fill_price = float(price)
+            try:
+                if isinstance(last_order, dict):
+                    avg_val = last_order.get('average') or last_order.get('price')
+                    if avg_val is not None:
+                        avg_f = float(avg_val)
+                        if avg_f > 0:
+                            fill_price = avg_f
+            except Exception:
+                pass
 
             # 3) pasang SL/TP reduceOnly
             sl_id, tp_id = await self._place_protective_orders(symbol, side, filled_qty, sl, tp)
@@ -176,7 +207,7 @@ class ExecutionHandler:
                 "symbol": symbol,
                 "side": side,
                 "qty": float(filled_qty),
-                "entry_price": float(price),
+                "entry_price": float(fill_price),
                 "sl": float(sl),
                 "tp": float(tp),
                 "entry_order_id": entry_id,
