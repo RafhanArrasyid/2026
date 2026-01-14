@@ -21,17 +21,20 @@ class Dashboard:
 
     def log(self, message, level="INFO"):
         """Menyimpan log untuk ditampilkan di dashboard"""
+        lvl = (level or "INFO").upper()
+        if lvl == "INFO":
+            return
         timestamp = datetime.now().strftime("%H:%M:%S")
-        color = Colors.GREEN if level == "INFO" else (Colors.YELLOW if level == "WARN" else Colors.RED)
+        color = Colors.GREEN if lvl == "INFO" else (Colors.YELLOW if lvl == "WARN" else Colors.RED)
         # Sekarang Colors.DIM sudah ada, jadi baris ini tidak akan error lagi
-        self.logs.append(f"{Colors.DIM}{timestamp}{Colors.RESET} | {color}{level:<5}{Colors.RESET} | {message}")
+        self.logs.append(f"{Colors.DIM}{timestamp}{Colors.RESET} | {color}{lvl:<5}{Colors.RESET} | {message}")
         if len(self.logs) > self.max_logs:
             self.logs.pop(0)
 
     def clear_screen(self):
         os.system('cls' if os.name == 'nt' else 'clear')
 
-    def render(self, balance, active_positions, btc_status="STABLE", btc_corr_display=""):
+    def render(self, balance, active_positions, btc_status="STABLE", btc_corr_display="", risk_display=""):
         self.clear_screen()
         
         # Header
@@ -61,6 +64,8 @@ class Dashboard:
         print(f" Equity  : {Colors.GREEN}${equity:,.2f}{Colors.RESET}")
         print(f" BTC Stat: {Colors.YELLOW if btc_status != 'STABLE' else Colors.GREEN}{btc_status}{Colors.RESET}")
         print(f" Risk    : {Config.RISK_PER_TRADE*100}% | Pairs: {len(Config.PAIRS)}")
+        if risk_display:
+            print(f" {risk_display}")
         corr_text = btc_corr_display if btc_corr_display else "none"
         try:
             corr_thresh = float(getattr(Config, "MAX_CORRELATION_BTC", 0.0))

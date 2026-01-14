@@ -1465,21 +1465,19 @@ class NeuroBot:
                 self._last_balance = float(bal)
                 await self._update_market_data()
                 await self._update_active_pairs_correlation()
+                risk_display = ""
                 if bal and float(bal) > 0:
                     risk_used = self._estimate_total_risk(float(bal))
                     max_risk = float(bal) * float(getattr(Config, 'MAX_TOTAL_RISK', 0.07))
                     remaining = max(max_risk - risk_used, 0.0)
-                    self._log(
-                        f"Risk used: {risk_used:.2f}/{max_risk:.2f} (rem {remaining:.2f})",
-                        "INFO",
-                    )
+                    risk_display = f"Risk Used: {risk_used:.2f}/{max_risk:.2f} (rem {remaining:.2f})"
                 
                 equity = self._calc_equity(bal)
                 self._update_drawdown(equity)
 
                 # Render Dashboard di loop scanner
                 corr_display = self._build_btc_corr_display()
-                self.dashboard.render(bal, self.active_positions_display, btc_corr_display=corr_display)
+                self.dashboard.render(bal, self.active_positions_display, btc_corr_display=corr_display, risk_display=risk_display)
 
                 if self.trading_paused:
                     await asyncio.sleep(float(Config.LOOP_SLEEP_SEC))
